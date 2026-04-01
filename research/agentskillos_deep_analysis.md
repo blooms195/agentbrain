@@ -181,28 +181,198 @@ def _build_tree(root, skills):
 
 **设计亮点**: 通过固定根类别确保一级分类的稳定性，同时用 LLM 自适应地发现子类别。单 skill 合并和叶节点提前终止减少了树深度。
 
-#### B. Multi-Level Tree Search (树搜索)
+#### B. Multi-Level Tree Search (树搜索) — `searcher.py` 深度解读
 
-```python
-# searcher.py 的核心逻辑
-def _search_node(query, node, depth):
-    if node.is_leaf:
-        return LLM_skill_selection(query, node.skills)  # 从叶节点选 skill
+##### B.1 四阶段流水线
 
-    if len(node.children) <= expand_threshold:
-        # 子节点数少，全部展开
-        return parallel_search_all_children(query, node.children)
-    else:
-        # 子节点数多，LLM 选择相关分支
-        selected_branches = LLM_node_selection(query, node.children)
-        return parallel_search(query, selected_branches)
-
-# 剪枝阶段
-def _prune_skills(query, candidates):
-    return LLM_dedup_and_rank(query, candidates, top_M=8)
+```
+┌──────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────┐
+│ 加载树    │ ──→ │ 递归搜索      │ ──→ │ 剪枝      │ ──→ │ 返回结果  │
+│ _load_tree│     │ _search_node │     │ _prune   │     │          │
+└──────────┘     └──────────────┘     └──────────┘     └──────────┘
 ```
 
-**设计亮点**: 自适应展开策略——小扇出全展开避免遗漏，大扇出 LLM 选择避免信息过载。并行搜索兄弟分支提高效率。
+入口 `search()` 方法重置计数器 → 懒加载 tree.yaml → 从根节点递归 `_search_node()` → 对候选集调用 `_prune_skills()` 去重排名。
+
+##### B.2 核心递归 `_search_node()` — 四个分支
+
+以 `branching_factor=8` 为例，派生参数为：
+- `expand_threshold = int(8 × 0.7) = 5` — 子节点 ≤ 5 个时全部展开
+- `early_stop_skill_count = int(8 × 1.7) = 13` — 剩余 skill ≤ 13 时提前终止
+- `max_skills_per_node = int(8 × 1.5) = 12` — 每个节点最多 12 个 skill
+
+```python
+def _search_node(self, query, node, depth):
+
+    # ═══ 分支 A：叶节点 → 直接让 LLM 从 skill 列表中选 ═══
+    if node.is_leaf:
+        return self._select_skills(query, node.skills, depth)
+        # → LLM 收到 SKILL_SELECTION_PROMPT，输入是 skill 列表，输出是选中 IDs
+
+    children = node.children
+
+    # ═══ 分支 B：子节点数 ≤ expand_threshold → 全部展开，不调 LLM ═══
+    if len(children) <= self.config.expand_threshold:  # ≤ 5
+        selected_children = children  # 直接全选，零 LLM 调用
+
+    # ═══ 分支 C：子节点数 > expand_threshold → LLM 选择相关分支 ═══
+    else:
+        selected_children = self._select_children(query, children, depth)
+        # → LLM 收到 NODE_SELECTION_PROMPT，输入是类别列表（含 skill 计数和描述），
+        #   输出是选中的类别 IDs
+
+    # ═══ 分支 D：早停优化 ═══
+    if len(selected_children) == 1:
+        only_child = selected_children[0]
+        total_skills = only_child.count_all_skills()
+        if total_skills <= self.config.early_stop_skill_count:  # ≤ 13
+            # 收集子树所有 skill，直接让 LLM 选，跳过递归
+            all_skills = only_child.collect_all_skills()
+            return self._select_skills(query, all_skills, depth)
+
+    # ═══ 递归：并行搜索多个选中的子分支 ═══
+    if len(selected_children) > 1:
+        results = self._parallel_search_children(query, selected_children, depth+1)
+        # ThreadPoolExecutor 并行，max_workers=min(len(children), max_parallel)
+    else:
+        results = self._search_node(query, selected_children[0], depth+1)
+
+    return results
+```
+
+四个分支的决策逻辑总结：
+
+| 决策点 | 条件 | 行为 | 设计意图 |
+|--------|------|------|---------|
+| **全展开** | `len(children) ≤ expand_threshold` | 不调 LLM，直接展开所有子节点 | 子节点少时全展开更安全，避免漏掉 |
+| **LLM 选择** | `len(children) > expand_threshold` | 调 LLM 选择相关分支 | 子节点多时需要推理过滤，节省搜索空间 |
+| **早停** | 仅 1 个子被选中 且 skill 总数 ≤ early_stop | 跳过递归，直接从所有 skill 中选 | 避免不必要的深层递归，减少 LLM 调用 |
+| **并行搜索** | 多个子被选中 | ThreadPoolExecutor 并行递归 | 降低延迟，多个分支同时搜索 |
+
+##### B.3 LLM Prompt 设计
+
+**NODE_SELECTION_PROMPT** — 用于分支 C（中间节点的子类别选择）：
+```
+User task: {query}
+
+Select the relevant categories for this task from the options below:
+
+- statistics: Statistics & Analysis (6 skills)
+  Tools for statistical modeling, hypothesis testing
+- visualization: Scientific Visualization (5 skills)
+  Creating charts, plots, and data visualizations
+...
+
+## Selection Principles
+- Select all categories that might be needed for the task
+- Consider what the user ultimately wants to achieve
+- If uncertain, select more rather than fewer        ← 宁多勿少，避免遗漏
+
+Output format (JSON array of selected IDs only):
+["statistics", "visualization"]
+```
+
+**SKILL_SELECTION_PROMPT** — 用于分支 A（叶节点的 skill 选择）：
+```
+User task: {query}
+
+Select the skills needed to complete this task:
+
+- generate-image: Generate images using AI models like DALL-E...
+- dall-e-wrapper: Direct DALL-E API integration...
+...
+
+## Selection Principles
+- Select all skills that could help complete the task
+- Consider skill combinations for complex tasks
+- Prefer skills that directly address the user's intent
+- **Exclude skills that can ONLY work through user interaction**  ← 排除交互式 skill
+
+Output format (JSON array of skill IDs only):
+["skill_id_1", "skill_id_2"]
+```
+
+**SKILL_PRUNE_PROMPT** — 用于剪枝阶段（去重 + 排名）：
+```
+User task: {query}
+
+## Skills to Evaluate
+- generate-image: ...
+- pptx: ...
+- scientific-slides: ...  ← 可能与 pptx 重叠
+
+## Rules
+1. Deduplicate: overlapping functionality → keep only the BEST one
+2. Keep generously: retain anything that could help
+3. CRITICAL: Order by relevance (most relevant FIRST)
+4. Prioritize DIVERSITY: avoid clustering similar skills at top  ← 多样性优先
+
+Output:
+{
+  "selected_skills": [{"id": "...", "reason": "..."}],
+  "eliminated": [{"id": "...", "reason": "..."}]
+}
+```
+
+##### B.4 完整调用链路示例
+
+以用户查询 `"Create a quantum computing presentation with illustrations"` 为例，假设 capability tree 有 200 个 skill：
+
+```
+search("Create a quantum computing presentation with illustrations")
+│
+├─ _search_node(root, depth=0)          ← 5个子节点 ≤ 5, 全展开（分支B）
+│  │
+│  ├─ [并行] _search_node(content-creation, depth=1)    ← 5个子节点 ≤ 5, 全展开
+│  │  ├─ [并行] _search_node(visual, depth=2)           ← 3个子节点 ≤ 5, 全展开
+│  │  │  ├─ [并行] _search_node(image-generation, depth=3)  ← 叶节点（分支A）
+│  │  │  │  └─ ★ LLM _select_skills() → [generate-image]   ← LLM调用 #1
+│  │  │  ├─ [并行] _search_node(infographic, depth=3)       ← 叶节点
+│  │  │  │  └─ ★ LLM _select_skills() → []                 ← LLM调用 #2
+│  │  │  └─ [并行] _search_node(graphic-design, depth=3)    ← 叶节点
+│  │  │     └─ ★ LLM _select_skills() → []                 ← LLM调用 #3
+│  │  ├─ [并行] _search_node(document, depth=2)
+│  │  │  ├─ _search_node(presentations, depth=3)        ← 叶节点
+│  │  │  │  └─ ★ LLM _select_skills() → [pptx, scientific-slides]  ← LLM调用 #4
+│  │  │  └─ _search_node(text-documents, depth=3)       ← 叶节点
+│  │  │     └─ ★ LLM _select_skills() → []              ← LLM调用 #5
+│  │  ├─ [并行] _search_node(video, depth=2) → []
+│  │  ├─ [并行] _search_node(audio, depth=2) → []
+│  │  └─ [并行] _search_node(social-media, depth=2) → []
+│  │
+│  ├─ [并行] _search_node(data-processing, depth=1)     ← 7个子节点 > 5（分支C）
+│  │  └─ ★ LLM _select_children() → [visualization]    ← LLM调用 #6
+│  │     └─ 早停（分支D）! 5 skills ≤ 13
+│  │        └─ ★ LLM _select_skills() → [sci-viz]      ← LLM调用 #7
+│  │
+│  ├─ [并行] _search_node(development, depth=1) → []
+│  ├─ [并行] _search_node(automation, depth=1) → []
+│  └─ [并行] _search_node(domain-specific, depth=1) → []
+│
+├─ 合并: [generate-image, pptx, scientific-slides, sci-viz]
+│
+└─ ★ LLM _prune_skills()                               ← LLM调用 #8
+   └─ 最终: [generate-image, scientific-slides]
+
+总计: 8 次 LLM 调用（搜索 200 个 skill 的树）
+```
+
+**关键设计洞察**：
+- 根节点的 5 个固定类别（content-creation 等）一定 ≤ `expand_threshold=5`，所以**根节点永远全展开、不调 LLM**，保证不会在第一步就漏掉整个类别
+- data-processing 的 7 个子节点 > 5，触发 LLM 选择（分支C），LLM 推理"量子计算演示"需要可视化，选中 visualization
+- visualization 只有 5 个 skill ≤ `early_stop=13`，触发早停（分支D），直接让 LLM 从 5 个 skill 中选，避免了继续递归
+- 并行搜索让延迟 ≈ max(各分支延迟) 而非 sum(各分支延迟)
+
+##### B.5 与纯语义检索的本质差异
+
+```
+纯语义检索:  query_embedding · skill_embedding → 单步余弦相似度
+树+LLM搜索:  query → LLM推理("完成这个任务需要什么能力?") → 逐层探索 → 多步推理发现
+```
+
+本质上，这是一个**"LLM 引导的剪枝搜索"**：树结构把搜索空间分层组织，LLM 在每一层决定哪些分支值得继续探索，不值得的分支整棵子树都被剪掉。最终只对少量叶节点的 skill 列表做精选。
+
+**设计亮点**: 自适应展开策略——小扇出全展开避免遗漏，大扇出 LLM 选择避免信息过载。并行搜索兄弟分支提高效率。早停优化减少不必要的递归深度。
 
 #### C. DAG Execution Engine (DAG 执行)
 
