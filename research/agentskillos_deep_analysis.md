@@ -619,7 +619,166 @@ Checkpoint 机制（`checkpoint.py`）保证了大规模评测的可恢复性。
 
 ---
 
-## 四、缺点与改进点
+## 四、论文对 Skill 评估的方案设计分析
+
+### 4.1 结论：论文没有 Skill 个体质量评估方案
+
+这是论文的一个重要缺失。论文的评估体系是**系统级的，不是 skill 级的**：
+
+| 评估层面 | 论文是否涉及 | 具体做法 |
+|---------|-------------|---------|
+| **Skill 个体质量** | ❌ 没有 | 没有对单个 skill 进行质量打分 |
+| **Skill 检索准确性** | ✅ 间接 | 通过 Oracle vs Tree-Retrieval 的对比来证明检索有效 |
+| **Skill 编排效果** | ✅ 核心 | DAG 编排 vs Flat 调用的对比 |
+| **最终产物质量** | ✅ 核心 | LLM 成对比较 + Bradley-Terry |
+
+### 4.2 论文中仅有的 Skill 筛选机制
+
+论文用了一个**非常简单的代理指标**来过滤 skill 质量：
+
+**Usage-Frequency Queue** — 仅用 install count 作为质量代理（论文 2.1.2 节）：
+
+> *AgentSkillOS maintains a usage-frequency queue Q that ranks s ∈ S by a frequency score f(s), which we set as the **install count** of skill s on the marketplace*
+
+这意味着 **install count 高 = 被认为是高质量**，这是一个非常粗糙的假设。
+
+### 4.3 代码中的相关实现——有但不充分
+
+代码中有一些与 skill 评估**相关但不充分**的机制：
+
+**1. Pruning Prompt** (`manager/tree/prompts.py:424-448`)
+
+在检索后由 LLM 去重和排名，但这是**任务相关的 relevance 排名**，不是 skill 自身的质量评估：
+```python
+# prompts.py — SKILL_PRUNE_PROMPT
+## Rules
+1. Deduplicate: overlapping functionality → keep only the BEST one
+2. Keep generously: retain anything that could help
+3. CRITICAL: Order by relevance (most relevant FIRST)
+4. Prioritize DIVERSITY
+# → 排的是"与当前任务的相关性"，不是 skill 本身的质量
+```
+
+**2. 客观评估器** (`benchmark/AgentSkillOS_bench/evaluators/objective/`)
+
+存在 `file_evaluators.py`（文件存在性、内容检查）、`format_evaluators.py`、`numeric_evaluators.py` 等，但这些评估的是**任务执行结果的产物质量**，不是 skill 本身：
+
+```python
+# file_evaluators.py
+@evaluator("file_exists")
+async def eval_file_exists(workspace, op_args, ...):
+    # 检查输出文件是否存在、大小是否超过阈值
+    # → 评估的是"任务产物"，不是"skill 质量"
+
+@evaluator("file_content_check")
+async def eval_file_content_check(workspace, op_args, ...):
+    # 检查文件内容是否包含特定关键词或匹配正则
+    # → 同样是产物级别的检查
+```
+
+**3. Benchmark 评估** (`benchmark/AgentSkillOS_bench/ranking/rank.py`)
+
+评的是"整个系统在 30 个任务上的产物质量"，使用 Bradley-Terry 排名。但这是**系统级**的，无法归因到单个 skill 的贡献：
+
+```
+Quality-First (整体) = 100.0 分
+  → 无法得知: generate-image 贡献了多少? pptx 贡献了多少?
+```
+
+**4. Active/Dormant 分层** (`manager/tree/models.py`)
+
+仅有的 skill "质量信号"是 install count：
+
+```python
+class SkillStatus(str, Enum):
+    ACTIVE = "active"      # Top N by installs → 进入 capability tree
+    DORMANT = "dormant"    # 剩余 → 向量索引
+    PINNED = "pinned"      # 用户手动 pin → 强制进入 tree
+```
+
+### 4.4 论文自己承认这个缺失
+
+在 **Conclusions and Future Work** 中明确将 skill quality assessment 列为未来工作：
+
+> *"automated skill collection, including discovery of new skills from open sources, **quality assessment**, and continuous integration into the ecosystem, is a natural next step."*
+
+### 4.5 Skill 评估方案设计建议
+
+如果要补充 skill 个体质量评估，建议构建四层评估体系：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Skill 质量评估框架                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 静态评估 (离线，无需执行)                                      │
+│     ├── 完整性: SKILL.md 是否包含 description/instructions/       │
+│     │          scripts/examples 四个核心部分                      │
+│     ├── 代码质量: scripts/ 下的代码是否通过 lint/type check        │
+│     ├── 文档质量: 描述是否清晰、参数是否说明、有无使用示例          │
+│     ├── 安全性: 是否有危险操作 (rm -rf, sudo)、权限是否过度         │
+│     └── 得分: 0-25 分                                            │
+│                                                                 │
+│  2. 动态评估 (在线，需要执行)                                      │
+│     ├── 成功率: 在标准测试用例上的执行通过率 (pass/fail)            │
+│     ├── 鲁棒性: 对异常输入 (空文件、格式错误) 的容错能力           │
+│     ├── 产物质量: LLM 评判输出 vs 无 skill 基线                   │
+│     ├── 资源效率: 耗时、token 消耗、API 调用次数                  │
+│     └── 得分: 0-35 分（权重最高，因为执行效果最直接）              │
+│                                                                 │
+│  3. 生态评估 (社区信号)                                           │
+│     ├── Install count (论文已有)                                  │
+│     ├── Star/Rating (如果平台支持)                                │
+│     ├── 活跃度: 最近更新时间、issue 响应率                        │
+│     ├── 作者信誉: is_official、author 历史贡献                    │
+│     └── 得分: 0-20 分                                            │
+│                                                                 │
+│  4. 使用后评估 (反馈驱动)                                         │
+│     ├── 用户反馈: 执行后的满意度评分                               │
+│     ├── DAG 贡献度: 去掉该 skill 后整体产物质量下降多少            │
+│     │   → Shapley Value 方法归因每个 skill 的边际贡献              │
+│     ├── 失败分析: 该 skill 在不同 DAG 中的失败率和失败原因分布     │
+│     └── 得分: 0-20 分                                            │
+│                                                                 │
+│  ─────────────────────────────────────────────────────────────── │
+│  综合得分 = w₁·静态(25) + w₂·动态(35) + w₃·生态(20) + w₄·反馈(20)│
+│  → 替代 install count 作为 Active/Dormant 分层决策                │
+│  → 在树搜索时作为 LLM 的辅助参考信号                              │
+│  → 在 DAG 编排时优先选择高质量 skill                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**各层评估的具体实现思路**:
+
+| 评估层 | 评估时机 | 成本 | 实现方式 |
+|--------|---------|------|---------|
+| **静态** | skill 入库时，一次性 | 低 | 规则检查 + LLM 文档质量评分 |
+| **动态** | 定期 (如每周) | 中 | 构造测试用例 → 执行 → 检查输出 |
+| **生态** | 实时拉取 | 低 | API 查询 marketplace 数据 |
+| **反馈** | 每次任务执行后 | 低 | 自动收集执行日志 + 用户评分 |
+
+**Shapley Value 归因示例** — 量化单个 skill 在 DAG 中的贡献度：
+
+```
+任务: "制作量子计算演示文稿"
+DAG: generate-image → scientific-slides (Quality-First)
+最终产物质量: BT Score = 85
+
+Shapley 计算:
+  只用 generate-image: BT Score = 40 (有图但格式差)
+  只用 scientific-slides: BT Score = 55 (格式好但图是占位符)
+  两者组合: BT Score = 85
+
+  Shapley(generate-image) = (85 - 55 + 40 - 0) / 2 = 35
+  Shapley(scientific-slides) = (85 - 40 + 55 - 0) / 2 = 50
+
+→ scientific-slides 的边际贡献更大 (50 vs 35)
+→ 这个信息可以反馈到 skill 质量评分中
+```
+
+---
+
+## 五、缺点与改进点
 
 ### 缺点 1: Capability Tree 构建严重依赖 LLM，成本高且不可控
 
@@ -806,7 +965,7 @@ self.node_timeout = node_timeout if node_timeout is not None else ocfg.node_time
 
 ---
 
-## 五、与 SkillOrchestra 的对比分析
+## 六、与 SkillOrchestra 的对比分析
 
 | 维度 | AgentSkillOS | SkillOrchestra |
 |------|-------------|----------------|
@@ -825,7 +984,7 @@ self.node_timeout = node_timeout if node_timeout is not None else ocfg.node_time
 
 ---
 
-## 六、演进路线建议
+## 七、演进路线建议
 
 ### 短期（1-2个月）
 
